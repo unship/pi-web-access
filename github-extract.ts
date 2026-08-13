@@ -30,6 +30,7 @@ const MAX_INLINE_FILE_CHARS = 100_000;
 const MAX_TREE_ENTRIES = 200;
 
 export interface GitHubUrlInfo {
+	host: string;
 	owner: string;
 	repo: string;
 	ref?: string;
@@ -48,6 +49,7 @@ interface GitHubCloneConfig {
 	maxRepoSizeMB: number;
 	cloneTimeoutSeconds: number;
 	clonePath: string;
+	hosts: string[];
 }
 
 const cloneCache = new Map<string, CachedClone>();
@@ -90,7 +92,8 @@ function loadGitHubConfig(): GitHubCloneConfig {
 		enabled: true,
 		maxRepoSizeMB: 350,
 		cloneTimeoutSeconds: 30,
-		clonePath: "/tmp/pi-github-repos",
+		clonePath: "/tmp/pi-git-repos",
+		hosts: ["github.com", "codeberg.org", "gitlab.com"],
 	};
 
 	if (!existsSync(CONFIG_PATH)) {
@@ -99,20 +102,24 @@ function loadGitHubConfig(): GitHubCloneConfig {
 	}
 
 	const rawText = readFileSync(CONFIG_PATH, "utf-8");
-	let raw: { githubClone?: { enabled?: unknown; maxRepoSizeMB?: unknown; cloneTimeoutSeconds?: unknown; clonePath?: unknown } };
+	let raw: { gitForgeClone?: { enabled?: unknown; maxRepoSizeMB?: unknown; cloneTimeoutSeconds?: unknown; clonePath?: unknown; hosts?: unknown }; githubClone?: { enabled?: unknown; maxRepoSizeMB?: unknown; cloneTimeoutSeconds?: unknown; clonePath?: unknown } };
 	try {
-		raw = JSON.parse(rawText) as { githubClone?: { enabled?: unknown; maxRepoSizeMB?: unknown; cloneTimeoutSeconds?: unknown; clonePath?: unknown } };
+		raw = JSON.parse(rawText) as { gitForgeClone?: { enabled?: unknown; maxRepoSizeMB?: unknown; cloneTimeoutSeconds?: unknown; clonePath?: unknown; hosts?: unknown }; githubClone?: { enabled?: unknown; maxRepoSizeMB?: unknown; cloneTimeoutSeconds?: unknown; clonePath?: unknown } };
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		throw new Error(`Failed to parse ${CONFIG_PATH}: ${message}`);
 	}
 
-	const gc = raw.githubClone ?? {};
+	// `githubClone` remains supported for backwards compatibility.
+	const gc = raw.gitForgeClone ?? raw.githubClone ?? {};
 	cachedConfig = {
 		enabled: normalizeEnabled(gc.enabled, defaults.enabled),
 		maxRepoSizeMB: normalizePositiveNumber(gc.maxRepoSizeMB, defaults.maxRepoSizeMB),
 		cloneTimeoutSeconds: normalizePositiveNumber(gc.cloneTimeoutSeconds, defaults.cloneTimeoutSeconds),
 		clonePath: normalizeClonePath(gc.clonePath, defaults.clonePath),
+		hosts: Array.isArray(gc.hosts)
+			? gc.hosts.filter((host): host is string => typeof host === "string").map((host) => host.trim().toLowerCase()).filter(Boolean)
+			: defaults.hosts,
 	};
 	return cachedConfig;
 }
@@ -126,7 +133,7 @@ const NON_CODE_SEGMENTS = new Set([
 	"sponsors", "invitations", "notifications", "insights",
 ]);
 
-export function parseGitHubUrl(url: string): GitHubUrlInfo | null {
+export function parseGitHubUrl(url: string, configuredHosts = ["github.com", "codeberg.org", "gitlab.com"]): GitHubUrlInfo | null {
 	let parsed: URL;
 	try {
 		parsed = new URL(url);
@@ -135,7 +142,8 @@ export function parseGitHubUrl(url: string): GitHubUrlInfo | null {
 	}
 
 	const host = parsed.hostname.toLowerCase();
-	if (host !== "github.com" && host !== "www.github.com") return null;
+	const forgeHost = host === "www.github.com" ? "github.com" : host;
+	if (!configuredHosts.includes(forgeHost)) return null;
 
 	const segments = parsed.pathname
 		.split("/")
@@ -149,41 +157,59 @@ export function parseGitHubUrl(url: string): GitHubUrlInfo | null {
 		});
 	if (segments.length < 2) return null;
 
-	const owner = segments[0];
-	const repo = segments[1].replace(/\.git$/, "");
+	// GitLab supports nested groups and puts `-/` before blob/tree routes.
+	// Configured non-GitHub/Codeberg hosts are assumed to be self-hosted GitLab.
+	// They must be explicitly allowlisted in `gitForgeClone.hosts` to avoid
+	// treating arbitrary web URLs as repositories.
+	const isGitLab = forgeHost === "gitlab.com" || (forgeHost !== "github.com" && forgeHost !== "codeberg.org");
+	const routeMarker = isGitLab ? segments.indexOf("-") : -1;
+	const repoEnd = routeMarker >= 0 ? routeMarker : segments.length;
+	if (repoEnd < 2) return null;
+	const repo = segments[repoEnd - 1].replace(/\.git$/, "");
+	const owner = segments.slice(0, repoEnd - 1).join("/");
+	const route = routeMarker >= 0 ? segments.slice(routeMarker + 1) : [];
 
-	if (NON_CODE_SEGMENTS.has(segments[2]?.toLowerCase())) return null;
-
-	if (segments.length === 2) {
-		return { owner, repo, refIsFullSha: false, type: "root" };
+	if (routeMarker < 0 && isGitLab) {
+		if (NON_CODE_SEGMENTS.has(segments[segments.length - 1]?.toLowerCase())) return null;
+		return { host: forgeHost, owner, repo, refIsFullSha: false, type: "root" };
+	}
+	if (routeMarker < 0 && segments.length === 2) {
+		return { host: forgeHost, owner, repo, refIsFullSha: false, type: "root" };
+	}
+	if (routeMarker < 0 && segments.length > 2) {
+		if (NON_CODE_SEGMENTS.has(segments[2]?.toLowerCase())) return null;
+		if (!isGitLab) {
+			const action = segments[2];
+			if (action !== "blob" && action !== "tree") return null;
+			const ref = segments[3];
+			if (!ref) return null;
+			return { host: forgeHost, owner, repo, ref, refIsFullSha: /^[0-9a-f]{40}$/.test(ref), path: segments.slice(4).join("/"), type: action };
+		}
+		return null;
 	}
 
-	const action = segments[2];
+	const action = route[0];
 	if (action !== "blob" && action !== "tree") return null;
-	if (segments.length < 4) return null;
-
-	const ref = segments[3];
-	const refIsFullSha = /^[0-9a-f]{40}$/.test(ref);
-	const pathParts = segments.slice(4);
-	const path = pathParts.length > 0 ? pathParts.join("/") : "";
-
+	const ref = route[1];
+	if (!ref) return null;
 	return {
+		host: forgeHost,
 		owner,
 		repo,
 		ref,
-		refIsFullSha,
-		path,
-		type: action as "blob" | "tree",
+		refIsFullSha: /^[0-9a-f]{40}$/.test(ref),
+		path: route.slice(2).join("/"),
+		type: action,
 	};
 }
 
-function cacheKey(owner: string, repo: string, ref?: string): string {
-	return ref ? `${owner}/${repo}@${ref}` : `${owner}/${repo}`;
+function cacheKey(host: string, owner: string, repo: string, ref?: string): string {
+	return ref ? `${host}/${owner}/${repo}@${ref}` : `${host}/${owner}/${repo}`;
 }
 
-function cloneDir(config: GitHubCloneConfig, owner: string, repo: string, ref?: string): string {
+function cloneDir(config: GitHubCloneConfig, host: string, owner: string, repo: string, ref?: string): string {
 	const dirName = ref ? `${repo}@${ref}` : repo;
-	return join(config.clonePath, owner, dirName);
+	return join(config.clonePath, host, owner, dirName);
 }
 
 const PROCESS_KILL_GRACE_MS = 3000;
@@ -282,9 +308,10 @@ async function cloneRepo(
 	repo: string,
 	ref: string | undefined,
 	config: GitHubCloneConfig,
+	host: string,
 	signal?: AbortSignal,
 ): Promise<string | null> {
-	const localPath = cloneDir(config, owner, repo, ref);
+	const localPath = cloneDir(config, host, owner, repo, ref);
 
 	try {
 		rmSync(localPath, { recursive: true, force: true });
@@ -292,7 +319,7 @@ async function cloneRepo(
 	}
 
 	const timeoutMs = config.cloneTimeoutSeconds * 1000;
-	const hasGh = await checkGhAvailable();
+	const hasGh = host === "github.com" && await checkGhAvailable();
 
 	if (hasGh) {
 		const args = ["gh", "repo", "clone", `${owner}/${repo}`, localPath, "--", "--depth", "1", "--single-branch"];
@@ -300,9 +327,9 @@ async function cloneRepo(
 		return execClone(args, localPath, timeoutMs, signal);
 	}
 
-	showGhHint();
+	if (host === "github.com") showGhHint();
 
-	const gitUrl = `https://github.com/${owner}/${repo}.git`;
+	const gitUrl = `https://${host}/${owner}/${repo}.git`;
 	const args = ["git", "clone", "--depth", "1", "--single-branch"];
 	if (ref) args.push("--branch", ref);
 	args.push(gitUrl, localPath);
@@ -594,7 +621,7 @@ async function awaitCachedClone(
 		const title = info.path ? `${owner}/${repo} - ${info.path}` : `${owner}/${repo}`;
 		return { url, title, content, error: null };
 	}
-	return fetchViaApi(url, owner, repo, info);
+	return info.host === "github.com" ? fetchViaApi(url, owner, repo, info) : null;
 }
 
 export async function extractGitHub(
@@ -602,30 +629,30 @@ export async function extractGitHub(
 	signal?: AbortSignal,
 	forceClone?: boolean,
 ): Promise<ExtractedContent | null> {
-	const info = parseGitHubUrl(url);
+	const config = loadGitHubConfig();
+	const info = parseGitHubUrl(url, config.hosts);
 	if (!info) return null;
 
 	if (signal?.aborted) return null;
 
-	const config = loadGitHubConfig();
 	if (!config.enabled) return null;
 
 	const { owner, repo } = info;
-	const key = cacheKey(owner, repo, info.ref);
+	const key = cacheKey(info.host, owner, repo, info.ref);
 
 	const cached = cloneCache.get(key);
 	if (cached) return awaitCachedClone(cached, url, owner, repo, info, signal);
 
-	if (info.refIsFullSha) {
+	if (info.refIsFullSha && info.host === "github.com") {
 		if (signal?.aborted) return null;
 		const sizeNote = `Note: Commit SHA URLs use the GitHub API instead of cloning.`;
 		return fetchViaApi(url, owner, repo, info, sizeNote);
 	}
 
-	const activityId = activityMonitor.logStart({ type: "fetch", url: `github.com/${owner}/${repo}` });
+	const activityId = activityMonitor.logStart({ type: "fetch", url: `${info.host}/${owner}/${repo}` });
 
 	if (!forceClone) {
-		const sizeKB = await checkRepoSize(owner, repo);
+		const sizeKB = info.host === "github.com" ? await checkRepoSize(owner, repo) : null;
 		if (signal?.aborted) {
 			activityMonitor.logComplete(activityId, 0);
 			return null;
@@ -671,8 +698,8 @@ export async function extractGitHub(
 		return cachedResult;
 	}
 
-	const clonePromise = cloneRepo(owner, repo, info.ref, config, signal);
-	const localPath = cloneDir(config, owner, repo, info.ref);
+	const clonePromise = cloneRepo(owner, repo, info.ref, config, info.host, signal);
+	const localPath = cloneDir(config, info.host, owner, repo, info.ref);
 	cloneCache.set(key, { localPath, clonePromise });
 
 	const result = await clonePromise;
@@ -689,7 +716,7 @@ export async function extractGitHub(
 			return null;
 		}
 
-		const apiFallback = await fetchViaApi(url, owner, repo, info);
+		const apiFallback = info.host === "github.com" ? await fetchViaApi(url, owner, repo, info) : null;
 		if (apiFallback) {
 			activityMonitor.logComplete(activityId, 200);
 			return apiFallback;

@@ -8,6 +8,23 @@ import { test } from "node:test";
 
 const extractModuleUrl = new URL("../github-extract.ts", import.meta.url).href;
 
+for (const [host, url] of [
+	["github.com", "https://github.com/owner/repo"],
+	["codeberg.org", "https://codeberg.org/thomp/dtk"],
+	["gitlab.com", "https://gitlab.com/owner/repo"],
+]) {
+	test(`parseGitHubUrl recognizes ${host} repositories`, async () => {
+		const { parseGitHubUrl } = await import(extractModuleUrl);
+		assert.deepEqual(parseGitHubUrl(url), {
+			host,
+			owner: host === "codeberg.org" ? "thomp" : "owner",
+			repo: host === "codeberg.org" ? "dtk" : "repo",
+			refIsFullSha: false,
+			type: "root",
+		});
+	});
+}
+
 async function writeFakeExecutable(binDir, name, source) {
 	const executable = join(binDir, name);
 	await writeFile(executable, `#!/usr/bin/env node\n${source}\n`, { mode: 0o755 });
@@ -122,6 +139,43 @@ test("normalizeClonePath handles absolute paths without expansion", async () => 
 	});
 
 	assert.equal(child.status, 0, child.stderr);
+});
+
+test("Codeberg clones use the forge HTTPS URL", { skip: process.platform === "win32" }, async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-web-access-codeberg-clone-"));
+	const agentDir = join(root, "agent-dir");
+	const binDir = join(root, "bin");
+	const argsFile = join(root, "args.json");
+	await mkdir(agentDir, { recursive: true });
+	await mkdir(binDir, { recursive: true });
+	await writeFile(join(agentDir, "web-search.json"), JSON.stringify({ gitForgeClone: { clonePath: join(root, "repos") } }), "utf8");
+	await writeFakeExecutable(binDir, "git", `
+		const { mkdirSync, writeFileSync } = require("node:fs");
+		const destination = process.argv.at(-1);
+		mkdirSync(destination, { recursive: true });
+		writeFileSync(destination + "/README.md", "fixture");
+		writeFileSync(${JSON.stringify(argsFile)}, JSON.stringify(process.argv.slice(2)));
+	`);
+	const child = spawnSync(process.execPath, ["--input-type=module"], {
+		input: `const { extractGitHub } = await import(${JSON.stringify(extractModuleUrl)}); console.log(JSON.stringify(await extractGitHub("https://codeberg.org/thomp/dtk")));`,
+		encoding: "utf8",
+		env: { ...process.env, PATH: `${binDir}${delimiter}${process.env.PATH || ""}`, PI_CODING_AGENT_DIR: agentDir },
+	});
+	assert.equal(child.status, 0, child.stderr);
+	assert.match(JSON.parse(await readFile(argsFile, "utf8")).join(" "), /https:\/\/codeberg\.org\/thomp\/dtk\.git/);
+});
+
+test("configured self-hosted GitLab URLs are parsed and cloned", { skip: process.platform === "win32" }, async () => {
+	const { parseGitHubUrl } = await import(extractModuleUrl);
+	assert.deepEqual(parseGitHubUrl("https://gitlab.example.com/platform/team/app/-/blob/main/README.md", ["gitlab.example.com"]), {
+		host: "gitlab.example.com",
+		owner: "platform/team",
+		repo: "app",
+		ref: "main",
+		refIsFullSha: false,
+		path: "README.md",
+		type: "blob",
+	});
 });
 
 test("GitHub clones disable interactive credential prompts", { skip: process.platform === "win32" }, async () => {
