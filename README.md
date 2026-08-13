@@ -20,7 +20,7 @@
 
 **Smart Fallbacks** — Every capability has a fallback chain. Search tries configured SearXNG first for local/private search, then OpenAI when suitable and available, Exa, Brave, Parallel, TinyFish, Search1API, Searchinfinity, Querit, Tavily, Firecrawl, Jina, SERPdive, Kagi, Bocha, Ollama, Perplexity, Gemini API, and Gemini Web when browser cookies are enabled. With no SearXNG configured, the existing zero-config order is unchanged. YouTube tries Gemini Web when enabled, then API, then Perplexity. Blocked pages try configured self-hosted Firecrawl first. Third-party hosted page fetchers require explicit `fetchRouting.allowRemoteHostedProviders` opt-in for remote HTTP(S) targets.
 
-**GitHub Cloning** — GitHub URLs are cloned locally instead of scraped. The agent gets real file contents and a local path to explore, not rendered HTML.
+**Git forge cloning** — GitHub, Codeberg, and GitLab repository URLs are cloned locally instead of scraped. The agent gets real file contents and a local path to explore, not rendered HTML.
 
 ## Install
 
@@ -179,11 +179,11 @@ The artifact includes `supported`, `contradicted`, `unclear`, or `missing-eviden
 
 ## Capabilities
 
-### GitHub repos
+### Git forge repositories
 
-GitHub URLs are cloned locally instead of scraped. The agent gets real file contents and a local path to explore with `read` and `bash`. Root URLs return the repo tree + README, `/tree/` paths return directory listings, `/blob/` paths return file contents.
+Public repository URLs on GitHub, Codeberg, and GitLab are cloned locally instead of scraped. The agent gets real file contents and a local path to explore with `read` and `bash`. Root URLs return the repo tree + README, `/tree/` paths return directory listings, and `/blob/` paths return file contents where the URL format is supported by the forge.
 
-Repos over 350MB get a lightweight API-based view instead of a full clone (override with `forceClone: true`). Commit SHA URLs are handled via the API. Clones are cached for the session and wiped on session change. Private repos require the `gh` CLI. Set `githubClone.enabled` to `false` to skip this GitHub-specific clone/API handling; `fetch_content` remains available, so the URL can continue through the normal HTTP extraction path.
+GitHub repositories over 350MB get a lightweight API-based view instead of a full clone (override with `forceClone: true`). GitLab and Codeberg use standard HTTPS Git cloning and do not require a forge-specific CLI. GitHub private repositories can use the `gh` CLI; private Codeberg and GitLab repositories use the configured Git credential helper (for example `osxkeychain`, `libsecret`, or a GitLab deploy-token credential). For self-hosted GitLab, add its hostname to `gitForgeClone.hosts`; credentials stay in Git's normal credential system and are not put in the clone URL. Clones are cached for the session and wiped on session change. Set `gitForgeClone.enabled` to `false` to skip forge repository handling. The legacy `githubClone` configuration key remains supported.
 
 ### YouTube videos
 
@@ -257,7 +257,7 @@ web_search(query)
 
 fetch_content(url)
   → Video file?  Gemini API (Files API) → Gemini Web (if browser cookies enabled)
-  → GitHub URL?  Clone repo, return file contents + local path
+  → Git forge URL (GitHub/Codeberg/GitLab)? Clone repo, return file contents + local path
   → YouTube URL? Gemini Web (if browser cookies enabled) → Gemini API → Perplexity
   → HTTP fetch → PDF? Datalab → Gemini API → local text extraction, save to temp pi-web-pdf
                → HTML? Readability (+ declared Link/rel discovery) → RSC parser → Firecrawl (if configured) → third-party hosted fallbacks only when fetchRouting.allowRemoteHostedProviders is enabled
@@ -386,11 +386,12 @@ Config defaults to `~/.pi/web-search.json`, or `web-search.json` under `PI_CODIN
     "bind": "100.101.102.103"
   },
   "autoOpenBrowser": true,
-  "githubClone": {
+  "gitForgeClone": {
     "enabled": true,
+    "hosts": ["github.com", "codeberg.org", "gitlab.com", "gitlab.example.com"],
     "maxRepoSizeMB": 350,
     "cloneTimeoutSeconds": 30,
-    "clonePath": "/tmp/pi-github-repos"
+    "clonePath": "/tmp/pi-git-repos"
   },
   "youtube": {
     "enabled": true,
@@ -787,7 +788,7 @@ Both shortcuts are configurable via `~/.pi/web-search.json`:
 
 Values use the same format as pi keybindings (e.g. `ctrl+s`, `ctrl+shift+s`, `alt+r`). Changes take effect on next pi restart.
 
-Set `"enabled": false` under `tools`, `commands`, `image`, or `pdf` to disable that feature. Tool-specific settings override the legacy `webSearch.enabled` shorthand; without an override, it still disables `web_search` and `source_check`. `image.enabled: false` blocks direct image fetches and video frame extraction, and prevents video thumbnails. `pdf.enabled: false` blocks PDF extraction. For GitHub specifically, `githubClone.enabled: false` only skips clone/API specialization; it does not unregister `fetch_content` or block generic URL extraction. Pi restart is required for tool and command registration changes.
+Set `"enabled": false` under `tools`, `commands`, `image`, or `pdf` to disable that feature. Tool-specific settings override the legacy `webSearch.enabled` shorthand; without an override, it still disables `web_search` and `source_check`. `image.enabled: false` blocks direct image fetches and video frame extraction, and prevents video thumbnails. `pdf.enabled: false` blocks PDF extraction. For Git forges, `gitForgeClone.enabled: false` only skips clone/API specialization; it does not unregister `fetch_content` or block generic URL extraction. The legacy `githubClone.enabled` key remains supported. Pi restart is required for tool and command registration changes.
 
 Rate limits: Perplexity is capped at 10 requests/minute (client-side). Jina Search, TinyFish, Search1API, and Searchinfinity apply the plan limits documented by their APIs. Querit Search and Contents subscriptions are independent. Content fetches run 3 concurrent with a 30s timeout for the direct HTTP fetch of each URL. Remote extraction fallbacks carry their own budgets and are not covered by that number: Jina Reader 30s, Firecrawl 60s, Kagi Extract 60s, Ollama Web Fetch 60s, Bright Data Web Unlocker 60s, TinyFish up to 150s, Gemini 120s, Datalab 120s (capped at 300s, rate-limited to 25 requests/minute on the free tier). `pdf.maxSizeMB` defaults to 20 and is capped at 50.
 
@@ -799,7 +800,8 @@ Rate limits: Perplexity is capped at 10 requests/minute (client-side). Jina Sear
 - Gemini can process videos up to ~1 hour; longer videos may be truncated.
 - PDFs are text-extracted only (no OCR for scanned documents).
 - GitHub branch names with slashes may misresolve file paths; the clone still works and the agent can navigate manually.
-- Non-code GitHub URLs (issues, PRs, wiki) fall through to normal web extraction.
+- Non-code Git forge URLs (issues, PRs, wiki) fall through to normal web extraction.
+- Self-hosted GitLab hosts must be explicitly listed in `gitForgeClone.hosts`; this prevents arbitrary websites from being interpreted as repositories.
 
 <details>
 <summary>Files</summary>
@@ -842,7 +844,7 @@ Rate limits: Perplexity is capped at 10 requests/minute (client-side). Jina Sear
 | `chrome-cookies.ts` | macOS/Linux Chromium-based cookie extraction (Keychain/secret-tool + SQLite) |
 | `youtube-extract.ts` | YouTube detection, three-tier extraction, frame extraction |
 | `video-extract.ts` | Local video detection, Files API upload, Gemini analysis |
-| `github-extract.ts` | GitHub URL parsing, clone cache, content generation |
+| `github-extract.ts` | Git forge URL parsing, clone cache, content generation |
 | `github-api.ts` | GitHub API fallback for large repos and commit SHAs |
 | `perplexity.ts` | Perplexity API client with rate limiting |
 | `datalab-pdf-extract.ts` | Datalab hosted PDF-to-Markdown conversion client (upload → convert → poll) |
